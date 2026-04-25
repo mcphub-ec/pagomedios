@@ -1,0 +1,363 @@
+openapi: 3.0.0
+info:
+  title: API PagoMedios V2 (Abitmedia)
+  description: Especificación OpenAPI 3.0 completa para PagoMedios V2. Cubre Solicitudes de pago, Links de pago, Recurrencia (Tokenización y Cobros), Reversos y Configuraciones.
+  version: 2.0.0
+servers:
+  - url: https://api.abitmedia.cloud/pagomedios/v2
+    description: Api Pagomedios (Producción)
+security:
+  - BearerAuth: []
+
+paths:
+  # ==========================================
+  # SOLICITUDES DE PAGO
+  # ==========================================
+  /payment-requests:
+    get:
+      summary: Retorna las solicitudes de pago
+      operationId: getPaymentRequests
+      responses:
+        '200':
+          description: Lista de solicitudes obtenida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentRequests'
+    post:
+      summary: Crear solicitud de pago
+      description: Genera una solicitud de cobro que es notificada al cliente.
+      operationId: createPaymentRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+      responses:
+        '201':
+          description: Solicitud creada con éxito.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessPaymentRequest'
+
+  # ==========================================
+  # LINKS DE PAGO
+  # ==========================================
+  /payment-links:
+    get:
+      summary: Retorna los links de pago
+      operationId: getPaymentLinks
+      responses:
+        '200':
+          description: Lista de links obtenida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentLinks'
+    post:
+      summary: Crear link de pago
+      description: Genera una URL de pago permanente para compartir.
+      operationId: createPaymentLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentLink'
+      responses:
+        '201':
+          description: Link de pago creado.
+
+  # ==========================================
+  # RECURRENCIA Y TARJETAS
+  # ==========================================
+  /cards:
+    get:
+      summary: Listado de tarjetas tokenizadas
+      operationId: getCards
+      responses:
+        '200':
+          description: Listado de tarjetas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cards'
+
+  /cards/{token}:
+    delete:
+      summary: Borrar tarjeta
+      description: Elimina una tarjeta tokenizada de la cuenta.
+      operationId: deleteCard
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Token único de la tarjeta a eliminar.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tarjeta eliminada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteCard'
+
+  /cards/register:
+    post:
+      summary: Registrar tarjeta de crédito
+      description: Inicia el proceso de tokenización o registra directamente una tarjeta.
+      operationId: registerCard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterCard'
+      responses:
+        '201':
+          description: Tarjeta registrada correctamente.
+
+  /cards/charge:
+    post:
+      summary: Realizar cobro
+      description: Efectúa un cargo directo a una tarjeta tokenizada previamente.
+      operationId: chargeCard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Charge'
+      responses:
+        '201':
+          description: Cobro realizado con éxito.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessCharge'
+        '422':
+          description: Fallo en la validación o fondos insuficientes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFailed'
+
+  # ==========================================
+  # REVERSOS
+  # ==========================================
+  /cards/reverse:
+    post:
+      summary: Realizar reverso de cobro
+      description: Reversa una transacción aprobada (solo disponible el mismo día del cargo).
+      operationId: reverseCharge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Reverse'
+      responses:
+        '201':
+          description: Reverso exitoso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessReverse'
+
+  # ==========================================
+  # CONFIGURACIONES DEL COMERCIO
+  # ==========================================
+  /settings:
+    get:
+      summary: Retorna las configuraciones de la compañia
+      operationId: getSettings
+      responses:
+        '200':
+          description: Configuraciones obtenidas exitosamente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessSettings'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Ingrese el token JWT de Abitmedia / PagoMedios.
+
+  schemas:
+    # --- Peticiones ---
+    CreatePaymentRequest:
+      type: object
+      required: [amount, description, document, customer_name, customer_email]
+      properties:
+        amount:
+          type: number
+          format: float
+          description: Monto total a cobrar.
+        tax:
+          type: number
+          format: float
+          description: Valor del IVA (Opcional, si aplica).
+          default: 0
+        description:
+          type: string
+          description: Descripción de la orden.
+        reference:
+          type: string
+          description: Referencia interna de tu sistema.
+        document:
+          type: string
+          description: Número de documento (Cédula o RUC) del cliente.
+        customer_name:
+          type: string
+          description: Nombre completo del cliente.
+        customer_email:
+          type: string
+          format: email
+        customer_phone:
+          type: string
+
+    CreatePaymentLink:
+      type: object
+      required: [amount, description]
+      properties:
+        amount:
+          type: number
+          format: float
+        description:
+          type: string
+        reference:
+          type: string
+        notify_url:
+          type: string
+          format: uri
+          description: URL del Webhook que recibirá las notificaciones de pago.
+
+    RegisterCard:
+      type: object
+      description: Estructura de datos para tokenizar una tarjeta.
+      required: [card_number, exp_month, exp_year, cvv, holder_name]
+      properties:
+        card_number:
+          type: string
+        exp_month:
+          type: string
+        exp_year:
+          type: string
+        cvv:
+          type: string
+        holder_name:
+          type: string
+
+    Charge:
+      type: object
+      required: [token, amount, description]
+      properties:
+        token:
+          type: string
+          description: Token de la tarjeta previamente guardada.
+        amount:
+          type: number
+          format: float
+          description: Monto a cobrar.
+        tax:
+          type: number
+          format: float
+        description:
+          type: string
+        reference:
+          type: string
+
+    Reverse:
+      type: object
+      required: [transaction_id]
+      properties:
+        transaction_id:
+          type: string
+          description: ID de la transacción original a reversar.
+        reason:
+          type: string
+          description: Motivo del reverso.
+
+    # --- Respuestas ---
+    SuccessPaymentRequest:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            id: { type: string }
+            url: { type: string, description: "URL para que el cliente pague" }
+            status: { type: string }
+
+    SuccessCharge:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            transaction_id: { type: string }
+            status: { type: string }
+            authorization_code: { type: string }
+            amount: { type: number, format: float }
+
+    SuccessReverse:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+
+    SuccessSettings:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            company_name: { type: string }
+            currency: { type: string }
+            active: { type: boolean }
+
+    DeleteCard:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+
+    PaymentRequests:
+      type: array
+      items:
+        type: object
+        properties:
+          id: { type: string }
+          amount: { type: number, format: float }
+          status: { type: string }
+
+    PaymentLinks:
+      type: array
+      items:
+        type: object
+        properties:
+          id: { type: string }
+          url: { type: string }
+
+    Cards:
+      type: array
+      items:
+        type: object
+        properties:
+          token: { type: string }
+          last4: { type: string }
+          brand: { type: string }
+
+    ValidationFailed:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
