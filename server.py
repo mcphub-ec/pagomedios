@@ -24,6 +24,8 @@ Fuente de verdad técnica: docs/openapi.yaml
 import os
 import json
 import logging
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
 from typing import Any
 
 from dotenv import load_dotenv
@@ -31,6 +33,84 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Motor fiscal determinista — IVA Ecuador (PagoMedios / Abitmedia)
+# ---------------------------------------------------------------------------
+# El LLM NUNCA calcula impuestos. Solo pasa `monto` + `tipo_monto`.
+# PagoMedios espera dos campos float separados: `amount` (total) y `tax` (IVA).
+# Este módulo calcula ambos de forma determinista.
+# ---------------------------------------------------------------------------
+
+class TipoMonto(str, Enum):
+    """Indica si el monto dado por el usuario incluye IVA o es la base imponible."""
+    SUBTOTAL      = "subtotal"       # el usuario dio la base SIN IVA  (default)
+    TOTAL_CON_IVA = "total_con_iva"  # el usuario dio el total CON IVA incluido
+
+
+_TWO = Decimal("0.01")
+
+
+def _iva_rate() -> Decimal:
+    """Lee IVA_EC_PERCENTAGE del entorno. Fallback: 0.15 (15%)."""
+    raw = os.environ.get("IVA_EC_PERCENTAGE", "0.15")
+    try:
+        rate = Decimal(raw)
+        if not (Decimal(0) < rate <= Decimal(1)):
+            raise ValueError()
+        return rate
+    except Exception:
+        raise ValueError(
+            f"IVA_EC_PERCENTAGE inválido: {raw!r}. "
+            "Debe ser un decimal entre 0 y 1, ej. '0.15' para 15%."
+        )
+
+
+def _r2(v: Decimal) -> Decimal:
+    """Redondeo estricto a 2 decimales (ROUND_HALF_UP)."""
+    return v.quantize(_TWO, rounding=ROUND_HALF_UP)
+
+
+def _calcular_amount_tax(monto: float, tipo: TipoMonto) -> tuple[float, float]:
+    """Calcula (amount_total, tax_iva) como floats para PagoMedios.
+
+    PagoMedios espera:
+        amount → total a cobrar (subtotal + IVA)
+        tax    → monto del IVA incluido en `amount`
+
+    Args:
+        monto: El valor exacto dado por el usuario (en USD).
+        tipo:  TipoMonto.SUBTOTAL      → monto es la base sin IVA.
+               TipoMonto.TOTAL_CON_IVA → monto es el total ya con IVA.
+
+    Returns:
+        (amount_total, tax_iva) — ambos float con 2 dec de precisión.
+
+    Ejemplos:
+        _calcular_amount_tax(30.0, SUBTOTAL)
+            → (34.50, 4.50)
+        _calcular_amount_tax(30.0, TOTAL_CON_IVA)
+            → (30.00, 3.91)
+    """
+    if monto <= 0:
+        raise ValueError(f"monto debe ser > 0. Recibido: {monto}")
+    rate = _iva_rate()
+    d = Decimal(str(monto))
+
+    if tipo == TipoMonto.TOTAL_CON_IVA:
+        total    = _r2(d)
+        subtotal = _r2(d / (1 + rate))
+        iva      = _r2(total - subtotal)
+    else:  # SUBTOTAL
+        subtotal = _r2(d)
+        iva      = _r2(d * rate)
+        total    = _r2(subtotal + iva)
+
+    return float(total), float(iva)
+
+
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +142,16 @@ mcp = FastMCP(
         "  · One-time charge: crear_solicitud_pago → customer receives email with a pay button. "
         "  · Recurring charge: registrar_tarjeta → cobrar_tarjeta. "
         "  · Shareable link: crear_link_pago → share URL via WhatsApp or web. "
+        "MONETARY INPUT RULES (agent must follow strictly): "
+        "  · Pass `monto` (float) with the EXACT number the user stated. "
+        "  · Pass `tipo_monto`='subtotal' if the amount is WITHOUT IVA (default). "
+        "  · Pass `tipo_monto`='total_con_iva' if the amount ALREADY INCLUDES IVA. "
+        "  · NEVER compute tax or totals yourself. The server does it deterministically. "
         "IMPORTANT: "
         "  · Use a unique 'reference' per transaction to prevent duplicates. "
         "  · Reversals (reversar_cobro) are only available on the SAME DAY as the charge. "
-        "  · Error 422 from cobrar_tarjeta: expired card, insufficient funds, or declined."
+        "  · Error 422 from cobrar_tarjeta: expired card, insufficient funds, or declined. "
+        "The IVA rate is read from IVA_EC_PERCENTAGE env var (default 15%)."
     ))
 
 # ---------------------------------------------------------------------------
@@ -153,12 +239,13 @@ async def listar_solicitudes_pago() -> str:
 
 
 @mcp.tool()
-async def crear_solicitud_pago(    amount: float,
+async def crear_solicitud_pago(
+    monto: float,
     description: str,
     document: str,
     customer_name: str,
     customer_email: str,
-    tax: float = 0.0,
+    tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
     reference: str | None = None,
     customer_phone: str | None = None) -> str:
     """⚠️ MUTATION — Create and send a payment request to a customer by email — POST /payment-requests.
@@ -167,38 +254,52 @@ async def crear_solicitud_pago(    amount: float,
     with a button to complete the payment on the PagoMedios platform.
     Use crear_link_pago instead if you want a reusable link without sending an email.
 
+    MONETARY INPUT (agent MUST follow this contract):
+      monto (float): The EXACT amount the user stated — pass it verbatim, no rounding.
+      tipo_monto (enum):
+        · "subtotal"      → monto is the taxable base WITHOUT IVA (default).
+        · "total_con_iva" → monto is the final price ALREADY INCLUDING IVA.
+
+    ⚠️ DO NOT compute amount or tax yourself.
+       The server derives `amount` (total with IVA) and `tax` (IVA amount) internally.
+
     REQUIRED PARAMETERS:
-      amount (float): Total amount to charge (tax inclusive). Example: 11.20
+      monto (float): Amount exactly as stated by the user. Example: 30.0
       description (str): Description of what is being charged. Example: "Monthly subscription"
       document (str): Customer cedula or RUC. Example: "0912345678"
       customer_name (str): Customer full name. Example: "Juan Pérez"
       customer_email (str): Customer email address where the request will be sent.
-                            Example: "juan@example.com"
 
     OPTIONAL PARAMETERS:
-      tax (float, default=0.0): VAT amount already included in 'amount'. Example: 1.50
-      reference (str): Your internal system reference. Use a UUID to prevent duplicates
-                       in case of retries. Example: "a1b2c3d4-..."
+      tipo_monto (str, default="subtotal"): "subtotal" | "total_con_iva".
+      reference (str): Your internal system reference. Use a UUID to prevent duplicates.
       customer_phone (str): Customer phone number for additional contact.
 
     RETURNS:
       {"id": str, "url": str, "status": str}
 
-    EXAMPLE CALL:
-      crear_solicitud_pago(
-          token="eyJ...",
-          amount=11.20, description="Invoice #001",
-          document="0912345678", customer_name="Juan Pérez",
-          customer_email="juan@example.com", tax=1.50
-      )
+    EXAMPLE CALLS:
+      crear_solicitud_pago(monto=30.0, tipo_monto="subtotal",
+                           description="Invoice #001", document="0912345678",
+                           customer_name="Juan Pérez", customer_email="juan@example.com")
+      crear_solicitud_pago(monto=34.50, tipo_monto="total_con_iva",
+                           description="Invoice #001", document="0912345678",
+                           customer_name="Juan Pérez", customer_email="juan@example.com")
     """
+    amount_total, tax_iva = _calcular_amount_tax(monto, tipo_monto)
+
+    logger.info(
+        "[crear_solicitud_pago] monto=%.2f tipo=%s → amount=%.2f tax=%.2f",
+        monto, tipo_monto.value, amount_total, tax_iva,
+    )
+
     body: dict[str, Any] = {
-        "amount": amount,
-        "description": description,
-        "document": document,
-        "customer_name": customer_name,
+        "amount":         amount_total,
+        "description":    description,
+        "document":       document,
+        "customer_name":  customer_name,
         "customer_email": customer_email,
-        "tax": tax,
+        "tax":            tax_iva,
     }
     if reference is not None:
         body["reference"] = reference
@@ -234,8 +335,10 @@ async def listar_links_pago() -> str:
 
 
 @mcp.tool()
-async def crear_link_pago(    amount: float,
+async def crear_link_pago(
+    monto: float,
     description: str,
+    tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
     reference: str | None = None,
     notify_url: str | None = None) -> str:
     """⚠️ MUTATION — Create a permanent, reusable payment link — POST /payment-links.
@@ -243,23 +346,40 @@ async def crear_link_pago(    amount: float,
     Use this tool to generate a shareable payment URL. Unlike crear_solicitud_pago,
     this link can be shared multiple times (via WhatsApp, email, web button).
 
+    MONETARY INPUT (agent MUST follow this contract):
+      monto (float): The EXACT amount the user stated — pass it verbatim, no rounding.
+      tipo_monto (enum):
+        · "subtotal"      → monto is the taxable base WITHOUT IVA (default).
+        · "total_con_iva" → monto is the final price ALREADY INCLUDING IVA.
+
+    ⚠️ DO NOT compute the total amount yourself.
+       The server sets `amount` = total with IVA, computed from monto+tipo_monto.
+
     REQUIRED PARAMETERS:
-      amount (float): Fixed charge amount. Example: 25.00
+      monto (float): Amount exactly as stated by the user. Example: 25.0
       description (str): Description of the charge concept. Example: "Product catalog"
 
     OPTIONAL PARAMETERS:
+      tipo_monto (str, default="subtotal"): "subtotal" | "total_con_iva".
       reference (str): Your internal reference for tracking. Example: "PLAN-BASIC"
-      notify_url (str): Webhook URL that receives notification when someone pays
-                        using this link.
+      notify_url (str): Webhook URL that receives notification when someone pays.
 
     RETURNS:
       {"id": str, "url": str, "status": str}
 
-    EXAMPLE CALL:
-      crear_link_pago(token="eyJ...", amount=25.00, description="Product catalog")
+    EXAMPLE CALLS:
+      crear_link_pago(monto=25.0, tipo_monto="subtotal", description="Product catalog")
+      crear_link_pago(monto=28.75, tipo_monto="total_con_iva", description="Product catalog")
     """
+    amount_total, _ = _calcular_amount_tax(monto, tipo_monto)
+
+    logger.info(
+        "[crear_link_pago] monto=%.2f tipo=%s → amount=%.2f",
+        monto, tipo_monto.value, amount_total,
+    )
+
     body: dict[str, Any] = {
-        "amount": amount,
+        "amount":      amount_total,
         "description": description,
     }
     if reference is not None:
@@ -338,10 +458,11 @@ async def registrar_tarjeta(    card_number: str,
 
 
 @mcp.tool()
-async def cobrar_tarjeta(    card_token: str,
-    amount: float,
+async def cobrar_tarjeta(
+    card_token: str,
+    monto: float,
     description: str,
-    tax: float = 0.0,
+    tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
     reference: str | None = None) -> str:
     """⚠️ MUTATION — Charge a tokenized card directly — POST /cards/charge.
 
@@ -349,17 +470,24 @@ async def cobrar_tarjeta(    card_token: str,
     against a card that was previously saved with registrar_tarjeta.
     Save the returned transaction_id for potential reversals.
 
+    MONETARY INPUT (agent MUST follow this contract):
+      monto (float): The EXACT amount the user stated — pass it verbatim, no rounding.
+      tipo_monto (enum):
+        · "subtotal"      → monto is the taxable base WITHOUT IVA (default).
+        · "total_con_iva" → monto is the final price ALREADY INCLUDING IVA.
+
+    ⚠️ DO NOT compute amount or tax yourself.
+       The server derives `amount` (total) and `tax` (IVA) internally.
+
     REQUIRED PARAMETERS:
       card_token (str): Card token obtained from registrar_tarjeta or listar_tarjetas.
                         Example: "tok_abc123xyz"
-      amount (float): Amount to charge (tax inclusive). Example: 29.99
+      monto (float): Amount exactly as stated by the user. Example: 29.99
       description (str): Charge description visible on the customer's bank statement.
-                         Example: "Monthly Premium Plan"
 
     OPTIONAL PARAMETERS:
-      tax (float, default=0.0): VAT amount already included in 'amount'. Example: 3.99
-      reference (str): Unique internal ID. Use a UUID to prevent duplicate charges
-                       on retry. Example: "SUB-2025-0042"
+      tipo_monto (str, default="subtotal"): "subtotal" | "total_con_iva".
+      reference (str): Unique internal ID. Use a UUID to prevent duplicate charges on retry.
 
     RETURNS:
       {"transaction_id": str, "status": str, "authorization_code": str, "amount": float}
@@ -367,15 +495,24 @@ async def cobrar_tarjeta(    card_token: str,
     COMMON ERRORS:
       422: Insufficient funds, expired card, or declined by the bank.
 
-    EXAMPLE CALL:
-      cobrar_tarjeta(token="eyJ...", card_token="tok_abc123xyz",
-                     amount=29.99, description="Monthly Premium Plan", tax=3.99)
+    EXAMPLE CALLS:
+      cobrar_tarjeta(card_token="tok_abc123xyz", monto=29.99,
+                     description="Monthly Premium Plan", tipo_monto="subtotal")
+      cobrar_tarjeta(card_token="tok_abc123xyz", monto=34.49,
+                     description="Monthly Premium Plan", tipo_monto="total_con_iva")
     """
+    amount_total, tax_iva = _calcular_amount_tax(monto, tipo_monto)
+
+    logger.info(
+        "[cobrar_tarjeta] monto=%.2f tipo=%s → amount=%.2f tax=%.2f",
+        monto, tipo_monto.value, amount_total, tax_iva,
+    )
+
     body: dict[str, Any] = {
-        "token": card_token,
-        "amount": amount,
+        "token":       card_token,
+        "amount":      amount_total,
         "description": description,
-        "tax": tax,
+        "tax":         tax_iva,
     }
     if reference is not None:
         body["reference"] = reference
