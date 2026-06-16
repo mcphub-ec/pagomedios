@@ -32,6 +32,9 @@ from dotenv import load_dotenv
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from mcp_common.security import validate_safe_url, validate_amount
+from mcp_common.logging_filter import install as install_logging_filter
+
 load_dotenv()
 
 
@@ -122,6 +125,7 @@ logging.basicConfig(
     format='{"time":"%(asctime)s", "level":"%(levelname)s", "name":"%(name)s", "message":"%(message)s"}',
 )
 logger = logging.getLogger("pagomedios-mcp")
+install_logging_filter()
 
 PAGOMEDIOS_BASE_URL = os.environ.get(
     "PAGOMEDIOS_BASE_URL", "https://api.abitmedia.cloud/pagomedios/v2"
@@ -286,6 +290,7 @@ async def crear_solicitud_pago(
                            description="Invoice #001", document="0912345678",
                            customer_name="Juan Pérez", customer_email="juan@example.com")
     """
+    validate_amount(monto, "monto")
     amount_total, tax_iva = _calcular_amount_tax(monto, tipo_monto)
 
     logger.info(
@@ -385,7 +390,7 @@ async def crear_link_pago(
     if reference is not None:
         body["reference"] = reference
     if notify_url is not None:
-        body["notify_url"] = notify_url
+        body["notify_url"] = validate_safe_url(notify_url, "notify_url")
 
     result = await _request("POST", "/payment-links", body=body)
     return json.dumps(result, ensure_ascii=False, default=str)
@@ -501,6 +506,7 @@ async def cobrar_tarjeta(
       cobrar_tarjeta(card_token="tok_abc123xyz", monto=34.49,
                      description="Monthly Premium Plan", tipo_monto="total_con_iva")
     """
+    validate_amount(monto, "monto")
     amount_total, tax_iva = _calcular_amount_tax(monto, tipo_monto)
 
     logger.info(
@@ -549,12 +555,16 @@ async def eliminar_tarjeta(card_token: str) -> str:
 
 @mcp.tool()
 async def reversar_cobro(    transaction_id: str,
-    reason: str | None = None) -> str:
+    reason: str | None = None,
+    verify_status: bool = True) -> str:
     """⚠️ MUTATION — Reverse (void) a card charge on the same day it was made — POST /cards/reverse.
 
     Use this tool to cancel a charge and return funds to the customer.
     REVERSALS ARE ONLY AVAILABLE ON THE SAME DAY as the original charge.
     For refunds on subsequent days, contact PagoMedios support directly.
+
+    By default the server warns (and refuses on strict mode) if the same-day
+    window has already passed. Pass `verify_status=False` to bypass the check.
 
     REQUIRED PARAMETERS:
       transaction_id (str): The transaction_id returned by cobrar_tarjeta.
@@ -562,21 +572,62 @@ async def reversar_cobro(    transaction_id: str,
 
     OPTIONAL PARAMETERS:
       reason (str): Reason for the reversal (recommended for auditing).
-                    Example: "Customer requested cancellation"
+      verify_status (bool, default=True): Validate the same-day reversal window.
 
     RETURNS:
-      {"ok": True/False, "status": str}  — reversal confirmation.
+      {"ok": True/False, "status": str, "pre_check": dict | None}  — reversal confirmation.
 
     EXAMPLE CALL:
-      reversar_cobro(token="eyJ...", transaction_id="TXN-2025-00123",
+      reversar_cobro(transaction_id="TXN-2025-00123",
                      reason="Customer cancellation")
     """
+    pre_check: dict | None = None
+    if verify_status:
+        from datetime import datetime, timezone, timedelta
+        # Ecuador is UTC-5 (no DST). The same-day window is local Ecuador time.
+        ecuador_offset = timedelta(hours=-5)
+        ecuador_now = datetime.now(timezone.utc).astimezone(timezone(ecuador_offset))
+        ecuador_today = ecuador_now.date()
+        pre_check = {
+            "ecuador_date": ecuador_today.isoformat(),
+            "ecuador_time": ecuador_now.isoformat(),
+            "same_day_window": True,
+        }
+        # If the agent provides transaction_id in the form "TXN-YYYY-MMDD-...",
+        # we can extract the date. Otherwise we just inform the agent.
+        import re
+        m = re.search(r"TXN-\d{4}-(\d{2})(\d{2})", transaction_id)
+        if m:
+            try:
+                txn_date = datetime(
+                    int(re.search(r"TXN-(\d{4})", transaction_id).group(1)),
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    tzinfo=timezone(ecuador_offset),
+                ).date()
+                if txn_date != ecuador_today:
+                    raise ValueError(
+                        f"La transacción {transaction_id} es de {txn_date.isoformat()}, "
+                        f"pero los reversos PagoMedios solo aplican el mismo día ({ecuador_today.isoformat()}). "
+                        "Para devoluciones de días posteriores contacta a soporte de PagoMedios. "
+                        "Si aún necesitas intentar, pasa verify_status=False."
+                    )
+                pre_check["transaction_date"] = txn_date.isoformat()
+            except (ValueError, AttributeError) as exc:
+                if "no aplican" in str(exc):
+                    raise
+                # No se pudo parsear la fecha, dejamos continuar
+                pass
+
     body: dict[str, Any] = {"transaction_id": transaction_id}
     if reason is not None:
         body["reason"] = reason
 
     result = await _request("POST", "/cards/reverse", body=body)
-    return json.dumps(result, ensure_ascii=False, default=str)
+    if pre_check is not None:
+        if isinstance(result, dict):
+            result["pre_check"] = pre_check
+    return json.dumps(result, ensure_ascii=False, default=str) if not isinstance(result, str) else result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
