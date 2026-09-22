@@ -63,7 +63,7 @@ def build_tool(spec: ToolSpec):
     ns = dict(_EXEC_GLOBALS)
     ns["__dispatch"] = _dispatch
     ns["__spec"] = spec
-    exec(compile(src, f"<tool:{spec.name}>", "exec"), ns)  # noqa: S102
+    exec(compile(src, f"<tool:{spec.name}>", "exec"), ns)  # nosec B102
     fn = ns[spec.name]
     fn.__doc__ = spec.doc
     fn.__module__ = "tools._registry"
